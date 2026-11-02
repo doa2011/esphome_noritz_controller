@@ -1,14 +1,160 @@
-# Noritz Water Heater Controller in ESPHome
+# Noritz 热水器智能控制器
+基于 ESP8266、ESPHome 的 Noritz 热水器有线遥控器扩展项目，将相关状态和控制接入 Home Assistant。
+感谢blindlight86和kejinlu的研究，感谢ai，
+目前项目已在Noritz RC-7606M-B 有线遥控器上测试通过。
+> **项目状态：开发与协议研究阶段**
 
-## Hardware
-4 wires connection: 
-- power button
-- up button
-- down button
-- tx
+> 按键模拟和 UART 数据采集已完成初步验证。燃烧状态等数据的协议解析仍在研究中，不代表所有 Noritz 型号均兼容。
+## 1. 项目功能
+### 1.1 已实现或已验证的功能
+- ESP8266 模拟遥控器实体按键操作。
+- 通过 ESPHome 接入 Home Assistant。
+- 使用 UART 采集遥控器通信数据。
+- 以 2400 baud、8N1 参数接收串口数据。
+- 初步识别遥控器通信数据帧。
+- 解析部分电源状态和设定温度数据。
+### 1.2 后续研究方向
+- 解析热水器实际燃烧状态。
+- 解析燃烧功率及其他运行参数。
+- 完善通信协议校验和数据帧分类。
+- 实现更完整的 Home Assistant 实体与控制界面。
+## 2. 硬件组成
+| 硬件 | 型号或规格 | 用途 |
+|---|---|---|
+| 主控开发板 | ESP8266 NodeMCU V2 | 主控制器 |
+| 热水器遥控器 | Noritz RC-7606M-B | 原有控制与通信接口 |
+| 三极管 | S8050 NPN | 模拟实体按键 |
+| 基极电阻 | 1kΩ | 限制基极电流 |
+| 下拉电阻 | 10kΩ | 防止三极管误导通 |
+| 电源模块 | 独立稳压电源 | 为 ESP8266 供电 |
+## 3. 硬件连接
+### 3.1 ESP8266 与按键模拟电路
+本项目采用 NPN 三极管模拟遥控器实体按键。
+每个按键使用一个 S8050 三极管，通过 ESP8266 GPIO 控制三极管导通，使遥控器对应按键的信号端与公共地连接，实现按键触发。
+| 功能 | NodeMCU 引脚 | ESP8266 GPIO |
+|---|---|---|
+| 电源按键 | D5 | GPIO14 |
+| 温度增加 | D6 | GPIO12 |
+| 温度降低 | D7 | GPIO13 |
+| UART 接收 | D2 | GPIO4 |
+| GND | GND | 公共参考地 |
 
-uart baud rate: 2400
-## License
-MIT License
-
-Copyright (c) 2022 blindlight86
+说明：
+1. 三极管基极通过 1kΩ 电阻连接 ESP8266 GPIO。
+2. 基极与发射极之间设置 10kΩ 下拉电阻。
+3. 集电极连接遥控器对应按键的信号端。
+4. 发射极连接遥控器按键公共地。
+5. 三极管导通时，相当于按下遥控器实体按键。
+### 3.2 UART 通信连接
+当前采集参数：
+| 参数 | 设置 |
+|---|---|
+| 通信波特率 | 2400 |
+| 数据位 | 8 |
+| 校验位 | None |
+| 停止位 | 1 |
+| 接收引脚 | ESP8266 GPIO4（D2） |
+目前通过遥控器电路板上的候选 TX 信号点进行数据采集。
+**电平接口特别说明：**
+遥控器 TX 空载测量电压约为 5V。使用 CH340 USB 串口适配器的 3.3V 接收档能够采集到数据，经测试 1kΩ 串联、2kΩ 下拉分压方案会明显拉低遥控器 TX 电压，导致通信异常，因此不建议照搬该分压方案，方案通过 1kΩ 串联接入D2可用，不代表可以放心接入D2针脚。
+在确定合适的高输入阻抗电平转换或缓冲电路之前，将该信号直接接入 ESP8266 GPIO需慎重，后果自负。
+### 3.3 电源连接
+ESP8266 使用独立稳压电源供电。
+此前尝试从遥控器电路板 78LR05 稳压器输入端取电，测得该处约 10V，但增加 ESP8266 负载后出现遥控器异常重启。
+注意事项：
+- 不要直接从遥控器通信线取电。
+- 不要将未确认的通信线路当作电源线使用。
+- 独立供电时，应先确认遥控器与 ESP8266 是否具有公共地参考。
+- 不得将不同电源的正极未经确认直接并联。
+## 4. ESPHome 软件配置
+项目使用 ESPHome 开发，设备型号为 ESP8266 NodeMCU V2，配置详见yaml文件。
+### 4.1 UART 数据调试
+调试阶段可以使用 ESPHome UART Debug 观察接收到的数据。
+```yaml
+uart:
+  id: noritz_uart
+  rx_pin: GPIO4
+  baud_rate: 2400
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 256
+  debug:
+    direction: RX
+    dummy_receiver: false
+    after:
+      bytes: 6
+    sequence:
+      - lambda: |-
+          UARTDebug::log_hex(direction, bytes, ' ');
+```
+如果原配置中已经存在 `uart` 或 `logger`，应合并配置，不要重复定义。
+`dummy_receiver: false` 用于避免 Debug 接收器独占数据，使实际 UART 设备组件仍能读取数据。
+## 5. 通信协议初步分析
+目前观察到的通信数据以 6 字节为一帧。
+### 5.1 已观察到的 DF EF 数据帧
+例如：
+```text
+DF EF FF FE DB F5
+DF EF FF FE DC F6
+```
+其中部分数据帧与原有开源项目的解析规则相符。
+根据目前使用的解析规则：
+- `data[3]` 最低位用于判断电源状态。
+- `data[4]` 的低四位用于解析设定温度。
+- `data[5]` 为校验相关字段。
+例如：
+| 数据帧 | 温度字段 | 解析温度 |
+|---|---|---|
+| `DF EF FF FE DB F5` | DB | 42℃ |
+| `DF EF FF FE DC F6` | DC | 41℃ |
+以上是基于现有解析规则得到的结果，仍需通过实际遥控器操作进一步验证。
+### 5.2 待机状态下的 DF ED 数据帧
+在遥控器待机状态下，观察到周期性出现的另一种数据帧：
+```text
+DF ED F1 72 FD D5
+DF ED F3 FF FF EE
+DF ED F5 FF FF F0
+DF ED F7 FF FF F2
+DF ED F9 FF FF F4
+DF ED FB FF FF F6
+DF ED FD FF F0 E9
+DF ED FF FE DB F3
+``
+初步观察：
+1. 帧头为 `DF ED`。
+2. 第三个字节呈现 `F1、F3、F5……FF` 的递增规律。
+3. 数据通常约每 50 秒出现一次。
+4. 该帧与 `DF EF` 数据帧属于不同类型。
+5. 其具体功能和字段含义尚未确认。
+目前推测可能与周期性轮询、状态同步或通信计数有关，但尚不能确定。
+### 5.3 协议研究计划
+后续将通过以下实验分析数据字段：
+- 遥控器待机状态下连续采集。
+- 单独按下电源键。
+- 单独按下温度增加键。
+- 单独按下温度降低键。
+- 打开热水并稳定燃烧。
+- 关闭热水并观察停火过程。
+重点分析不同工作状态下的数据帧变化，寻找实际燃烧状态及其他运行参数对应的字段。
+## 6. Home Assistant 接入
+设备通过 ESPHome API 接入 Home Assistant。
+计划提供以下实体：
+| 实体 | 功能 |
+|---|---|
+| Noritz Power | 热水器电源控制 |
+| Noritz Power State | 热水器电源状态 |
+| Noritz Temperature | 设定温度 |
+| Noritz Temperature Up | 温度增加 |
+| Noritz Temperature Down | 温度降低 |
+## 7. 安全与兼容性说明
+1. 本项目属于第三方 DIY 扩展，不是 Noritz 官方产品。
+2. 不同 Noritz 热水器型号及遥控器版本的通信协议可能不同。
+3. 不要在未确认电气特性的情况下直接连接 ESP8266 GPIO。
+4. 热水器原有安全保护、温控及燃气控制电路不得擅自修改。
+5. 所有按键模拟应保持短时触发，避免 GPIO 长时间导通。
+6. 安装及调试应避免影响热水器原有控制和安全功能。
+## 8. 致谢与参考
+- ESPHome 官方文档：https://esphome.io/
+- 参考项目：https://github.com/blindlight86/esphome_noritz_controller
+- 相关通信协议研究：https://kejinlu.com/2022/10/noritz-controller/
